@@ -16,6 +16,8 @@ struct QueueInfo
 
 enum class Profile
 {
+	H264_Base,
+	H264_Main,
 	H264_High
 };
 

@@ -1035,7 +1035,7 @@ void H264EncodeInfo::setup(
 	pic.flags.IdrPicFlag = is_idr ? 1 : 0;
 	pic.flags.is_reference = 1;
 	if (is_idr)
-		pic.idr_pic_id = rate.idr_pic_id++;
+		pic.idr_pic_id = uint16_t(rate.idr_pic_id++);
 	pic.pRefLists = &ref_lists;
 
 	slice.pStdSliceHeader = &slice_header;
@@ -1174,6 +1174,8 @@ bool Encoder::Impl::record_and_submit_encode(VkCommandBuffer cmd, Frame &frame, 
 
 	switch (info.profile)
 	{
+	case Profile::H264_Base:
+	case Profile::H264_Main:
 	case Profile::H264_High:
 		h264.setup(caps, session_params, rate, video_coding_info, encode_info);
 		break;
@@ -1713,16 +1715,25 @@ VideoProfile::Format VideoProfile::get_format_info(Encoder::Impl &impl, VkImageU
 
 bool VideoProfile::setup(Encoder::Impl &impl, Profile profile)
 {
+	h264.profile = { VK_STRUCTURE_TYPE_VIDEO_ENCODE_H264_PROFILE_INFO_KHR };
+	profile_info.chromaSubsampling = VK_VIDEO_CHROMA_SUBSAMPLING_420_BIT_KHR;
+	profile_info.chromaBitDepth = VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR;
+	profile_info.lumaBitDepth = VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR;
+	profile_info.videoCodecOperation = VK_VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR;
+	profile_info.pNext = &h264.profile;
+
 	switch (profile)
 	{
+	case Profile::H264_Base:
+		h264.profile.stdProfileIdc = STD_VIDEO_H264_PROFILE_IDC_BASELINE;
+		break;
+
+	case Profile::H264_Main:
+		h264.profile.stdProfileIdc = STD_VIDEO_H264_PROFILE_IDC_MAIN;
+		break;
+
 	case Profile::H264_High:
-		h264.profile = { VK_STRUCTURE_TYPE_VIDEO_ENCODE_H264_PROFILE_INFO_KHR };
-		profile_info.chromaSubsampling = VK_VIDEO_CHROMA_SUBSAMPLING_420_BIT_KHR;
-		profile_info.chromaBitDepth = VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR;
-		profile_info.lumaBitDepth = VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR;
-		profile_info.videoCodecOperation = VK_VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR;
 		h264.profile.stdProfileIdc = STD_VIDEO_H264_PROFILE_IDC_HIGH;
-		profile_info.pNext = &h264.profile;
 		break;
 
 	default:
@@ -1750,6 +1761,8 @@ bool VideoEncoderCaps::setup(Encoder::Impl &impl)
 
 	switch (impl.info.profile)
 	{
+	case Profile::H264_Base:
+	case Profile::H264_Main:
 	case Profile::H264_High:
 		h264.caps = { VK_STRUCTURE_TYPE_VIDEO_ENCODE_H264_CAPABILITIES_KHR };
 		encode_caps.pNext = &h264.caps;
@@ -1855,6 +1868,8 @@ bool VideoSessionParameters::init(Encoder::Impl &impl)
 {
 	switch (impl.info.profile)
 	{
+	case Profile::H264_Base:
+	case Profile::H264_Main:
 	case Profile::H264_High:
 		return init_h264(impl);
 
@@ -2074,6 +2089,8 @@ bool RateControl::init(Encoder::Impl &impl)
 
 	switch (impl.info.profile)
 	{
+	case Profile::H264_Base:
+	case Profile::H264_Main:
 	case Profile::H264_High:
 		is_h264 = true;
 		break;
