@@ -1949,8 +1949,9 @@ bool VideoSessionParameters::init_h264(Encoder::Impl &impl)
 		sps.chroma_format_idc = STD_VIDEO_H264_CHROMA_FORMAT_IDC_444;
 
 	// TODO
+	// Note that baseline doesnt do 10bit.
 	constexpr bool is_10bit = false;
-	if (is_10bit)
+	if (is_10bit && impl.info.profile != Profile::H264_Base)
 	{
 		sps.bit_depth_luma_minus8 = 2;
 		sps.bit_depth_chroma_minus8 = 2;
@@ -1994,6 +1995,23 @@ bool VideoSessionParameters::init_h264(Encoder::Impl &impl)
 		pps.flags.transform_8x8_mode_flag = 1;
 	if (impl.caps.h264.caps.stdSyntaxFlags & VK_VIDEO_ENCODE_H264_STD_ENTROPY_CODING_MODE_FLAG_SET_BIT_KHR)
 		pps.flags.entropy_coding_mode_flag = 1;
+
+	if (impl.info.profile == Profile::H264_Base)
+	{
+		// Level should be 3.0 or lower for baseline (to be confirmed by actual source other than ChatGPT).
+		if (sps.level_idc > STD_VIDEO_H264_LEVEL_IDC_3_0)
+			sps.level_idc = STD_VIDEO_H264_LEVEL_IDC_3_0;
+		// Baseline does not support CABAC encoding (only CAVLC) but caps can still set the 
+		// VK_VIDEO_ENCODE_H264_STD_ENTROPY_CODING_MODE_FLAG_SET_BIT_KHR flag !!! (angry face)
+		pps.flags.entropy_coding_mode_flag = 0;
+		// Weight prediction not supported in Baseline.
+		pps.flags.weighted_pred_flag = 0;
+		pps.weighted_bipred_idc = STD_VIDEO_H264_WEIGHTED_BIPRED_IDC_DEFAULT;
+		// Custom scaling matrices not supported in Baseline.
+		pps.flags.pic_scaling_matrix_present_flag = 0;
+		// 8x8 Transform mode not supported in Baseline.
+		pps.flags.transform_8x8_mode_flag = 0;
+	}
 
 	add_info.pStdPPSs = &pps;
 	add_info.pStdSPSs = &sps;
