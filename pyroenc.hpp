@@ -18,7 +18,10 @@ enum class Profile
 {
 	H264_Base,
 	H264_Main,
-	H264_High
+	H264_High,
+
+	H265_Main,
+	H265_Main10,
 };
 
 struct EncoderCreateInfo

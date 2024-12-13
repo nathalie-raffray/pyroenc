@@ -8,11 +8,17 @@
 #include <queue>
 #include <assert.h>
 #include <stdio.h>
+#include <cmath>
 
 #define VK_CALL(x) table.x
 
 namespace PyroEnc
 {
+constexpr uint32_t align_size(uint32_t size, uint32_t alignment)
+{
+	return (size + alignment - 1) & ~(alignment - 1);
+}
+
 struct VkTable
 {
 #define INSTANCE_FUNCTION(fun) PFN_vk##fun vk##fun
@@ -99,6 +105,7 @@ struct VideoProfile
 		struct
 		{
 			VkVideoEncodeH265ProfileInfoKHR profile;
+			StdVideoH265ProfileTierLevel profile_tier_level;
 		} h265;
 	};
 
@@ -156,6 +163,22 @@ struct VideoSessionParameters
 			StdVideoH264SequenceParameterSetVui vui;
 			VkVideoEncodeH264QualityLevelPropertiesKHR quality_level_props;
 		} h264;
+
+		struct
+		{
+			// Describes global encoding parameters for H.265, such as max sub-layers and temporal layers.
+			StdVideoH265VideoParameterSet vps;
+			// Defines sequence-specific parameters, including resolution, bit depth, and chroma format.
+			StdVideoH265SequenceParameterSet sps;
+			// Specifies picture-specific parameters, such as entropy coding and slice settings.
+			StdVideoH265PictureParameterSet pps;
+			// Video Usability Information (VUI) parameters provide additional information about the video sequence 
+			// to the decoder or playback system, such as color properties, aspect ratios, and timing information. 
+			StdVideoH265SequenceParameterSetVui vui;
+			// Holds Vulkan-specific information about quality levels for H.265 encoding.
+			// Allows configuration of quality trade-offs (e.g., compression efficiency vs. speed).
+			VkVideoEncodeH265QualityLevelPropertiesKHR quality_level_props;
+		} h265;
 	};
 
 	bool init(Encoder::Impl &impl);
@@ -163,6 +186,8 @@ struct VideoSessionParameters
 	std::vector<uint8_t> encoded_parameters;
 
 	bool init_h264(Encoder::Impl &impl);
+	bool init_h265(Encoder::Impl &impl);
+	bool init_h265_with_minimal_parameters(Encoder::Impl &impl);
 };
 
 struct RateControl
@@ -182,6 +207,12 @@ struct RateControl
 			VkVideoEncodeH264RateControlInfoKHR rate_control;
 			VkVideoEncodeH264RateControlLayerInfoKHR layer;
 		} h264;
+
+		struct
+		{
+			VkVideoEncodeH265RateControlInfoKHR rate_control;
+			VkVideoEncodeH265RateControlLayerInfoKHR layer;
+		} h265;
 	};
 
 	bool init(Encoder::Impl &impl);
@@ -198,6 +229,8 @@ struct RateControl
 // More than or 2 or 3 seems highly unusual.
 static constexpr uint32_t FramePoolSize = 4;
 // TODO: For B-frames, we might need 3.
+// Decoded Picture Buffer: a buffer used to store decoded frames that are
+// needed as reference pictures
 static constexpr uint32_t DPBSize = 2;
 // TODO: For B-frames, we might need 2.
 static constexpr uint32_t MaxActiveReferencePictures = DPBSize - 1;
@@ -1118,6 +1151,7 @@ bool Encoder::Impl::record_and_submit_encode(VkCommandBuffer cmd, Frame &frame, 
 		rate.gop_frame_index = 0;
 	is_idr = rate.gop_frame_index == 0;
 
+	// this could be an issue with h265?
 	const VkExtent2D coded_extent = { caps.get_aligned_width(info.width), caps.get_aligned_height(info.height) };
 	uint32_t dpb_index_reconstructed = rate.gop_frame_index & 1;
 	uint32_t dpb_index_reference = 1 - dpb_index_reconstructed;
@@ -1715,27 +1749,59 @@ VideoProfile::Format VideoProfile::get_format_info(Encoder::Impl &impl, VkImageU
 
 bool VideoProfile::setup(Encoder::Impl &impl, Profile profile)
 {
-	h264.profile = { VK_STRUCTURE_TYPE_VIDEO_ENCODE_H264_PROFILE_INFO_KHR };
 	profile_info.chromaSubsampling = VK_VIDEO_CHROMA_SUBSAMPLING_420_BIT_KHR;
 	profile_info.chromaBitDepth = VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR;
 	profile_info.lumaBitDepth = VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR;
-	profile_info.videoCodecOperation = VK_VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR;
-	profile_info.pNext = &h264.profile;
+	
+	switch (profile)
+	{
+	case Profile::H264_Base:
+	case Profile::H264_Main:
+	case Profile::H264_High:
+		h264.profile = { VK_STRUCTURE_TYPE_VIDEO_ENCODE_H264_PROFILE_INFO_KHR };
+		profile_info.videoCodecOperation = VK_VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR;
+		profile_info.pNext = &h264.profile;
+		break;
+
+	case Profile::H265_Main:
+	case Profile::H265_Main10:
+		h265.profile = { VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_PROFILE_INFO_KHR };
+		profile_info.videoCodecOperation = VK_VIDEO_CODEC_OPERATION_ENCODE_H265_BIT_KHR;
+		profile_info.pNext = &h265.profile;
+		h265.profile_tier_level.flags.general_interlaced_source_flag = 0;
+		h265.profile_tier_level.flags.general_progressive_source_flag = 1;
+		// idk
+		h265.profile_tier_level.flags.general_non_packed_constraint_flag = 1;
+		// Progressive encoding contains only frame-based coding, meaning the bitstream is not allowed
+		// to contain field-based pictures (it is purely progressive).
+		h265.profile_tier_level.flags.general_frame_only_constraint_flag = 1;
+		// 1 is High Tier, 0 is Main tier it should maybe depend on the level.
+		h265.profile_tier_level.flags.general_tier_flag = 1;
+		break;
+
+	default:
+		return false;
+	}
 
 	switch (profile)
 	{
 	case Profile::H264_Base:
 		h264.profile.stdProfileIdc = STD_VIDEO_H264_PROFILE_IDC_BASELINE;
 		break;
-
 	case Profile::H264_Main:
 		h264.profile.stdProfileIdc = STD_VIDEO_H264_PROFILE_IDC_MAIN;
 		break;
-
 	case Profile::H264_High:
 		h264.profile.stdProfileIdc = STD_VIDEO_H264_PROFILE_IDC_HIGH;
 		break;
-
+	case Profile::H265_Main:
+		h265.profile.stdProfileIdc = STD_VIDEO_H265_PROFILE_IDC_MAIN;
+		h265.profile_tier_level.general_profile_idc = STD_VIDEO_H265_PROFILE_IDC_MAIN;
+		break;
+	case Profile::H265_Main10:
+		h265.profile.stdProfileIdc = STD_VIDEO_H265_PROFILE_IDC_MAIN_10;
+		h265.profile_tier_level.general_profile_idc = STD_VIDEO_H265_PROFILE_IDC_MAIN_10;
+		break;
 	default:
 		return false;
 	}
@@ -1768,6 +1834,12 @@ bool VideoEncoderCaps::setup(Encoder::Impl &impl)
 		encode_caps.pNext = &h264.caps;
 		break;
 
+	case Profile::H265_Main:
+	case Profile::H265_Main10:
+		h265.caps = { VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_CAPABILITIES_KHR };
+		encode_caps.pNext = &h265.caps;
+		break;
+
 	default:
 		return false;
 	}
@@ -1788,14 +1860,12 @@ bool VideoEncoderCaps::setup(Encoder::Impl &impl)
 
 uint32_t VideoEncoderCaps::get_aligned_width(uint32_t width) const
 {
-	return (width + video_caps.pictureAccessGranularity.width - 1) &
-	       ~(video_caps.pictureAccessGranularity.width - 1);
+	return align_size(width, video_caps.pictureAccessGranularity.width);
 }
 
 uint32_t VideoEncoderCaps::get_aligned_height(uint32_t height) const
 {
-	return (height + video_caps.pictureAccessGranularity.height - 1) &
-	       ~(video_caps.pictureAccessGranularity.height - 1);
+	return align_size(height, video_caps.pictureAccessGranularity.height);
 }
 
 bool VideoSession::init(Encoder::Impl &impl)
@@ -1850,6 +1920,9 @@ bool VideoSession::init(Encoder::Impl &impl)
 	if (VK_CALL(vkBindVideoSessionMemoryKHR(impl.info.device, session, count, binds.data())) != VK_SUCCESS)
 		return false;
 
+	// After memory binding
+	printf("Video session successfully created and bound to memory: %p\n", (void *)session);
+
 	return true;
 }
 
@@ -1872,6 +1945,11 @@ bool VideoSessionParameters::init(Encoder::Impl &impl)
 	case Profile::H264_Main:
 	case Profile::H264_High:
 		return init_h264(impl);
+
+	case Profile::H265_Main:
+	case Profile::H265_Main10:
+		//return init_h265_with_minimal_parameters(impl);
+		return init_h265(impl);
 
 	default:
 		return false;
@@ -2084,6 +2162,544 @@ bool VideoSessionParameters::init_h264(Encoder::Impl &impl)
 	return true;
 }
 
+bool VideoSessionParameters::init_h265_with_minimal_parameters(Encoder::Impl &impl)
+{
+	auto &table = impl.table;
+
+	// Print detailed capabilities
+	printf("H265 Encode Capabilities:\n");
+	printf("Max Level IDC: %d\n", impl.caps.h265.caps.maxLevelIdc);
+	printf("Max Slice Segments: %d\n", impl.caps.h265.caps.maxSliceSegmentCount);
+	printf("CTB Sizes: 0x%x\n", impl.caps.h265.caps.ctbSizes);
+	printf("Transform Block Sizes: 0x%x\n", impl.caps.h265.caps.transformBlockSizes);
+	printf("Max Reference Count L0: %d\n", impl.caps.h265.caps.maxPPictureL0ReferenceCount);
+	printf("Max Reference Count L1: %d\n", impl.caps.h265.caps.maxL1ReferenceCount);
+	printf("Min/Max QP: %d/%d\n", impl.caps.h265.caps.minQp, impl.caps.h265.caps.maxQp);
+	printf("Capability Flags: 0x%x\n", impl.caps.h265.caps.flags);
+	printf("Std Syntax Flags: 0x%x\n", impl.caps.h265.caps.stdSyntaxFlags);
+
+	// Setup minimal valid VPS as before...
+	StdVideoH265ProfileTierLevel profile_tier = {};
+	profile_tier.general_profile_idc = STD_VIDEO_H265_PROFILE_IDC_MAIN;
+	profile_tier.general_level_idc = impl.caps.h265.caps.maxLevelIdc;
+	profile_tier.flags.general_tier_flag = 0;
+
+	StdVideoH265VideoParameterSet minimal_vps = {};
+	minimal_vps.vps_video_parameter_set_id = 0;
+	minimal_vps.vps_max_sub_layers_minus1 = 0;
+	minimal_vps.pProfileTierLevel = &profile_tier;
+	minimal_vps.flags.vps_temporal_id_nesting_flag = 1;
+	minimal_vps.flags.vps_sub_layer_ordering_info_present_flag = 1;
+	minimal_vps.flags.vps_timing_info_present_flag = 1;
+	minimal_vps.vps_num_units_in_tick = 1;
+	minimal_vps.vps_time_scale = 60;
+
+	// Create parameters
+	VkVideoSessionParametersCreateInfoKHR session_param_info =
+	{ VK_STRUCTURE_TYPE_VIDEO_SESSION_PARAMETERS_CREATE_INFO_KHR };
+	session_param_info.videoSession = impl.session.session;
+
+	VkVideoEncodeH265SessionParametersCreateInfoKHR h265_session_param_info =
+	{ VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_SESSION_PARAMETERS_CREATE_INFO_KHR };
+	h265_session_param_info.maxStdVPSCount = 1;
+	h265_session_param_info.maxStdPPSCount = 0;
+	h265_session_param_info.maxStdSPSCount = 0;
+
+	VkVideoEncodeH265SessionParametersAddInfoKHR add_info =
+	{ VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_SESSION_PARAMETERS_ADD_INFO_KHR };
+	add_info.stdVPSCount = 1;
+	add_info.pStdVPSs = &minimal_vps;
+
+	h265_session_param_info.pParametersAddInfo = &add_info;
+	session_param_info.pNext = &h265_session_param_info;
+
+	// Create parameters
+	VkVideoSessionParametersKHR test_params = VK_NULL_HANDLE;
+	VkResult create_result = VK_CALL(vkCreateVideoSessionParametersKHR(
+		impl.info.device,
+		&session_param_info,
+		nullptr,
+		&test_params));
+
+	printf("Parameter creation result: %d\n", create_result);
+
+	if (create_result != VK_SUCCESS)
+	{
+		printf("Failed to create session parameters\n");
+		return false;
+	}
+
+	printf("Session parameters created successfully\n");
+
+	// Try a different approach to getting encoded parameters
+	std::vector<uint8_t> buffer(4096);  // Start with 4KB
+	size_t buffer_size = buffer.size();
+
+	VkVideoEncodeH265SessionParametersGetInfoKHR h265_params_get_info =
+	{ VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_SESSION_PARAMETERS_GET_INFO_KHR };
+	// Just start with testing VPS
+	h265_params_get_info.writeStdVPS = VK_TRUE;
+	h265_params_get_info.stdVPSId = 0;
+
+	VkVideoEncodeSessionParametersGetInfoKHR params_get_info =
+	{ VK_STRUCTURE_TYPE_VIDEO_ENCODE_SESSION_PARAMETERS_GET_INFO_KHR };
+	params_get_info.videoSessionParameters = test_params;
+	params_get_info.pNext = &h265_params_get_info;
+
+	// Add feedback info
+	VkVideoEncodeH265SessionParametersFeedbackInfoKHR h265_feedback =
+	{ VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_SESSION_PARAMETERS_FEEDBACK_INFO_KHR };
+	VkVideoEncodeSessionParametersFeedbackInfoKHR feedback =
+	{ VK_STRUCTURE_TYPE_VIDEO_ENCODE_SESSION_PARAMETERS_FEEDBACK_INFO_KHR };
+	feedback.pNext = &h265_feedback;
+
+	// Try getting parameters directly with a buffer
+	VkResult encode_result = VK_CALL(vkGetEncodedVideoSessionParametersKHR(
+		impl.info.device,
+		&params_get_info,
+		&feedback,
+		&buffer_size,
+		buffer.data()));
+
+	printf("Direct get parameters result: %d\n", encode_result);
+	printf("Buffer size after call: %zu\n", buffer_size);
+
+	if (test_params != VK_NULL_HANDLE)
+	{
+		VK_CALL(vkDestroyVideoSessionParametersKHR(impl.info.device, test_params, nullptr));
+	}
+
+	return false;  // Return false while testing
+}
+
+bool VideoSessionParameters::init_h265(Encoder::Impl &impl)
+{
+	VkVideoSessionParametersCreateInfoKHR session_param_info =
+	{ VK_STRUCTURE_TYPE_VIDEO_SESSION_PARAMETERS_CREATE_INFO_KHR };
+	VkVideoEncodeH265SessionParametersCreateInfoKHR h265_session_param_info =
+	{ VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_SESSION_PARAMETERS_CREATE_INFO_KHR };
+	h265_session_param_info.maxStdVPSCount = 1;
+	h265_session_param_info.maxStdPPSCount = 1;
+	h265_session_param_info.maxStdSPSCount = 1;
+
+	constexpr auto vpsId = 0;
+	constexpr auto spsId = 0;
+	constexpr auto ppsId = 0;
+
+	// Note that a coding tree block is the largest unit of block structure in HEVC.
+	// A CTB can be recursively subdivided into smaller units called Coding Blocks (CBs).
+	uint8_t CodingTreeBlockSize;
+	if (impl.caps.h265.caps.ctbSizes & VkVideoEncodeH265CtbSizeFlagBitsKHR::VK_VIDEO_ENCODE_H265_CTB_SIZE_64_BIT_KHR)
+		CodingTreeBlockSize = 64u;
+	else if (impl.caps.h265.caps.ctbSizes & VkVideoEncodeH265CtbSizeFlagBitsKHR::VK_VIDEO_ENCODE_H265_CTB_SIZE_32_BIT_KHR)
+		CodingTreeBlockSize = 32u;
+	else if (impl.caps.h265.caps.ctbSizes & VkVideoEncodeH265CtbSizeFlagBitsKHR::VK_VIDEO_ENCODE_H265_CTB_SIZE_16_BIT_KHR)
+		CodingTreeBlockSize = 16u;
+	else
+	{
+		printf("[pyroenc] [init_h265] Failed to initialize CodingTreeBlockSize. impl.caps.h265.caps.ctbSizes: %d\n", impl.caps.h265.caps.ctbSizes);
+		return false;
+	}
+		
+	// Minimum coding block size. It cannot be smaller than 8.
+	constexpr auto MinCodingBlockSize = 8u;
+
+	const auto CodingTreeBlockLog2Size = uint8_t(std::log2(CodingTreeBlockSize));
+	const auto MinCodingBlockLog2Size = uint8_t(std::log2(MinCodingBlockSize)); // 3, so 8x8 CB
+
+	// H.265/HEVC supports a hierarchical temporal scalability mechanism. This means frames in a 
+	// video sequence can be encoded at different temporal resolutions (sub-layers), allowing for 
+	// efficient playback at different frame rates or quality levels.
+	// Temporal sub-layers provide flexibility, such as enabling lower-quality streams by skipping 
+	// higher sub-layers during decoding.
+	constexpr auto MaxSubLayers = 0;
+
+	// The following specify the size of the smallest and biggest transform block for the luma(brightness) component in a frame.
+	// Transform blocks are used to apply transforms(like DCT or DST) for encoding the residual data after
+	// motion prediction and intra prediction.
+	uint8_t MaxTransformBlockSize = 0;
+	uint8_t MinTransformBlockSize = 32;
+	if (impl.caps.h265.caps.transformBlockSizes & VkVideoEncodeH265TransformBlockSizeFlagBitsKHR::VK_VIDEO_ENCODE_H265_TRANSFORM_BLOCK_SIZE_32_BIT_KHR)
+	{
+		MaxTransformBlockSize = 32;
+	}
+	if (impl.caps.h265.caps.transformBlockSizes & VkVideoEncodeH265TransformBlockSizeFlagBitsKHR::VK_VIDEO_ENCODE_H265_TRANSFORM_BLOCK_SIZE_16_BIT_KHR)
+	{
+		MaxTransformBlockSize = std::max(MaxTransformBlockSize, uint8_t(16u));
+		MinTransformBlockSize = 16;
+	}
+	if (impl.caps.h265.caps.transformBlockSizes & VkVideoEncodeH265TransformBlockSizeFlagBitsKHR::VK_VIDEO_ENCODE_H265_TRANSFORM_BLOCK_SIZE_8_BIT_KHR)
+	{
+		MaxTransformBlockSize = std::max(MaxTransformBlockSize, uint8_t(8u));
+		MinTransformBlockSize = std::min(MinTransformBlockSize, uint8_t(8u));
+	}
+	//if (impl.caps.h265.caps.transformBlockSizes & VkVideoEncodeH265TransformBlockSizeFlagBitsKHR::VK_VIDEO_ENCODE_H265_TRANSFORM_BLOCK_SIZE_4_BIT_KHR)
+	//{
+	//	MaxTransformBlockSize = std::max(MaxTransformBlockSize, uint8_t(4u));
+	//	MinTransformBlockSize = std::min(MinTransformBlockSize, uint8_t(4u));
+	//}
+
+	// The minimum block size will be 2^MinTransformBlockLog2Size.
+	// Note that the smallest transform block size allowed in HEVC is 4x4 pixels.
+	const auto MinTransformBlockLog2Size = uint8_t(std::log2(MinTransformBlockSize));
+	// Note that the greatest transform block size allowed in HEVC is 32x32 pixels.
+	const auto MaxTransformBlockLog2Size = uint8_t(std::log2(MaxTransformBlockSize));
+
+	auto &vps = h265.vps;
+	auto &sps = h265.sps;
+	auto &pps = h265.pps;
+	auto &vui = h265.vui;
+
+	vps = {};
+	pps = {};
+	sps = {};
+	vui = {};
+
+	// TODO: need to change this alignedWidth and alignedHeight elsewhere so that it aligns with MinCodingBlockSize
+	// For HEVC, the picture width needs to be aligned according to Vulkan video capabilities (pictureAccessGranularity) and minimum coding block size.
+	auto alignment = std::max(impl.caps.video_caps.pictureAccessGranularity.width, MinCodingBlockSize);
+	const auto alignedWidth = align_size(impl.info.width, alignment);
+
+	alignment = std::max(impl.caps.video_caps.pictureAccessGranularity.height, MinCodingBlockSize);
+	const auto alignedHeight = align_size(impl.info.height, alignment);
+
+	// Initialize VPS
+	vps.vps_video_parameter_set_id = vpsId;
+	// H.265/HEVC supports a hierarchical temporal scalability mechanism. This means frames in a 
+	// video sequence can be encoded at different temporal resolutions (sub-layers), allowing for 
+	// efficient playback at different frame rates or quality levels.
+	// Temporal sub-layers provide flexibility, such as enabling lower-quality streams by skipping 
+	// higher sub-layers during decoding.
+	vps.vps_max_sub_layers_minus1 = MaxSubLayers;
+	// Frame duration = num_units_per_tick / time_scale
+	// Frame rate =  time_scale / num_units_per_tick
+	// This can also be set at the level of VUI.
+	vps.vps_num_units_in_tick = 0;
+	vps.vps_time_scale = 0;
+	// This is for decoding of POC (which is used with b frames when frames are encoded out of order).
+	// POC is an integer value that represents the display order of a frame within the video sequence. 
+	// It is used by decoders to correctly reorder frames for playback, particularly in streams with B-frames or other non-linear coding orders.
+	vps.vps_num_ticks_poc_diff_one_minus1 = 0;
+	// Temporal scalability allows encoding multiple sub-layers, each representing a different frame rate or temporal resolution.
+	// Nesting ensures that lower temporal sub-layers (e.g., lower frame rate) can be decoded independently of higher temporal sub-layers.
+	// we are not working with temporarl sublayers, but setting it to 1 is fine i think.
+	vps.flags.vps_temporal_id_nesting_flag = 1;
+	// Specifies whether is ordering info in sublayers (but we are not using sublayers).
+	vps.flags.vps_sub_layer_ordering_info_present_flag = 0;
+	// vps_timing_info_present_flag says whether to consider timing info like vps_num_units_in_tick and vps_time_scale
+	vps.flags.vps_timing_info_present_flag = 0;
+	// This indicates whether the Picture Order Count (POC) is proportional to the timing (or the time axis) for the video sequence.
+	// If this flag is set to 1, the POC values are proportional to the time axis (i.e., frames are ordered based on their presentation time).
+	vps.flags.vps_poc_proportional_to_timing_flag = 1;
+	// Probably a better place to initialize this..
+	impl.profile.h265.profile_tier_level.general_level_idc = impl.caps.h265.caps.maxLevelIdc;
+	vps.pProfileTierLevel = &impl.profile.h265.profile_tier_level;
+	// TODO set StdVideoH265HrdParameters? in vps.pHrdParameters
+
+	// Initialize SPS
+	if (impl.profile.profile_info.chromaSubsampling == VK_VIDEO_CHROMA_SUBSAMPLING_420_BIT_KHR)
+		sps.chroma_format_idc = STD_VIDEO_H265_CHROMA_FORMAT_IDC_420;
+	else if (impl.profile.profile_info.chromaSubsampling == VK_VIDEO_CHROMA_SUBSAMPLING_422_BIT_KHR)
+		sps.chroma_format_idc = STD_VIDEO_H265_CHROMA_FORMAT_IDC_422;
+	else
+		sps.chroma_format_idc = STD_VIDEO_H265_CHROMA_FORMAT_IDC_444;
+
+	// Luma samples are not subsampled like chroma so the following parameters will always be equal to pixel width/height.
+	sps.pic_width_in_luma_samples = alignedWidth;
+	sps.pic_height_in_luma_samples = alignedHeight;
+	sps.sps_video_parameter_set_id = vpsId;
+	// This is defined at the video level. Check vps.vps_max_sub_layers_minus1
+	sps.sps_max_sub_layers_minus1 = 0;
+	sps.sps_seq_parameter_set_id = spsId;
+
+	if (impl.profile.profile_info.lumaBitDepth == VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR)
+		sps.bit_depth_luma_minus8 = 0; // 8-bit luma
+	else if (impl.profile.profile_info.chromaBitDepth == VK_VIDEO_COMPONENT_BIT_DEPTH_10_BIT_KHR)
+		sps.bit_depth_luma_minus8 = 2; // 10-bit luma
+
+	if (impl.profile.profile_info.chromaBitDepth == VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR)
+		sps.bit_depth_chroma_minus8 = 0; // 8-bit chroma
+	else if (impl.profile.profile_info.chromaBitDepth == VK_VIDEO_COMPONENT_BIT_DEPTH_10_BIT_KHR)
+		sps.bit_depth_chroma_minus8 = 2; // 10-bit chroma
+
+	// This is used for the POC (picture order count)
+	// The Picture Order Count (POC) is a number that indicates the display order of a frame in the video timeline:
+	// Even though frames may be encoded out of order (e.g., B-frames in inter-frame prediction), the POC ensures that decoders can reconstruct the correct display sequence.
+	// This parameter defines the number of bits used for the LSB portion of the POC. Since the POC value may get very large 
+	// (depending on the length of the video sequence), the standard uses a wrap-around mechanism to save bits. Only the Least Significant Bits (LSB) of the POC are transmitted.
+	// Wrap-around: 
+	// The LSB portion wraps around after reaching its maximum value (2^log2_max_pic_order_cnt_lsb - 1), reducing the amount of data needed to represent POC values.
+	// Best to initilize even if POC won't be used apparently.
+	sps.log2_max_pic_order_cnt_lsb_minus4 = 8;
+	// Note that 8x8 is the minimum coding block size for luma.
+	// Luma coding block size = 2^(log2_min_luma_coding_block_size_minus3 + 3)
+	sps.log2_min_luma_coding_block_size_minus3 = MinCodingBlockLog2Size - 3;
+	// Note that 64x64 is the maximum coding block size for luma.
+	// Max Luma Coding Block Size = 2^(log2_min_luma_coding_block_size_minus3 + 3 + log2_diff_max_min_luma_coding_block_size)
+	sps.log2_diff_max_min_luma_coding_block_size = CodingTreeBlockLog2Size - MinCodingBlockLog2Size;
+	// Transform blocks are used to apply transforms(like DCT or DST) for encoding the residual data after motion prediction and intra prediction.
+	// Min transform block size = 2^(log2_min_luma_transform_block_size_minus2 + 2)
+	sps.log2_min_luma_transform_block_size_minus2 = MinTransformBlockLog2Size - 2;
+	// Max transform block size = 2^(log2_min_luma_transform_block_size_minus2 + 2 + log2_diff_max_min_luma_transform_block_size)
+	sps.log2_diff_max_min_luma_transform_block_size = MaxTransformBlockLog2Size - MinTransformBlockLog2Size;
+	// TODO: Maybe these could vary in terms of desired quality?
+	// Transform blocks are derived by subdiving Coding Tree Blocks.
+	// The depth controls how many times the CTB can be recursively subdivided (by 2) into smaller Transform Blocks (TBs) for encoding the residual signal.
+	sps.max_transform_hierarchy_depth_inter = uint8_t(std::max(CodingTreeBlockLog2Size - MinTransformBlockLog2Size, 1));
+	// Intra-predicted blocks are blocks predicted within the same frame (e.g. for I Frames).
+	// Inter-predicted blocks are blocks predicted using motion compensation from other frames (e.g. P Frames and B Frames).
+	sps.max_transform_hierarchy_depth_intra = uint8_t(std::max(CodingTreeBlockLog2Size - MinTransformBlockLog2Size, 1));
+
+	// Short-term reference pictures are previously encoded immediate past frames used to predict (encode or decode) subsequent frames.
+	// A reference picture set (RPS) defines a group of reference frames, indicating:
+	// Which frames are available for referencing.
+	// How to handle temporal relationships between frames.
+	sps.num_short_term_ref_pic_sets = MaxActiveReferencePictures > 0 ? 1 : 0;
+	// Long-term reference pictures are used to maintain a reference frame for a longer period, used particularly for sequences
+	// with inter-frame prediction. Used often when creating B-frames.
+	sps.num_long_term_ref_pics_sps = 0;
+	sps.pcm_sample_bit_depth_luma_minus1 = 8 - 1;
+	sps.pcm_sample_bit_depth_chroma_minus1 = 8 - 1;
+	// The smallest possible luma coding block size in the video.
+	// PCM (Picture Coding Mode): this refers to a coding mode where pixel data is encoded directly, without using transforms like
+	// the Discrete Cosine Transform (DCT). Typically used for parts of a video frame where high fidelity is required.
+	sps.log2_min_pcm_luma_coding_block_size_minus3 = MinCodingBlockLog2Size - 3;
+	sps.log2_diff_max_min_pcm_luma_coding_block_size = CodingTreeBlockLog2Size - MinCodingBlockLog2Size;
+
+	// TODO.
+	// Ensure that these parameters are set to crop any padded regions while still aligning with pictureAccessGranularity.
+	sps.conf_win_left_offset = 0;
+	sps.conf_win_bottom_offset = 0;
+	sps.conf_win_right_offset = 0;
+	sps.conf_win_top_offset = 0;
+	sps.pProfileTierLevel = &impl.profile.h265.profile_tier_level;
+	sps.pSequenceParameterSetVui = &vui;
+	// TODO MAYBE?
+	// sps.pShortTermRefPicSet = nullptr;
+
+	sps.flags.sps_sub_layer_ordering_info_present_flag = 0;
+	sps.flags.sps_scaling_list_data_present_flag = 0;
+	sps.flags.scaling_list_enabled_flag = 0;
+	sps.flags.long_term_ref_pics_present_flag = 0;
+	sps.flags.sps_palette_predictor_initializers_present_flag = 0;
+	sps.flags.sps_extension_present_flag = 0;
+	sps.flags.sample_adaptive_offset_enabled_flag = 1;
+	sps.flags.sps_temporal_mvp_enabled_flag = 1;
+	sps.flags.vui_parameters_present_flag = 1;
+	
+	// Initialize PPS
+	pps.pps_pic_parameter_set_id = ppsId;
+	pps.pps_seq_parameter_set_id = spsId;
+	pps.sps_video_parameter_set_id = vpsId;
+	pps.num_extra_slice_header_bits = 0;
+
+	// Number of active reference indicies in list 0 (used for P and B frames)
+	pps.num_ref_idx_l0_default_active_minus1 = MaxActiveReferencePictures - 1;
+	// Active reference pictures in list 1 are used for B frames so list 1 should be deactivated somewhere.
+	pps.num_ref_idx_l1_default_active_minus1 = 0;
+	// Refers to the initial quantization parameter (QP), which determines the level of compression applied to the video data.
+	pps.init_qp_minus26 = 0;
+	pps.diff_cu_qp_delta_depth = 0;
+	// These are copied from video samples
+	pps.pps_cb_qp_offset = 0;
+	//pps.pps_cr_qp_offset = 0;
+	pps.pps_beta_offset_div2 = 0;
+	pps.pps_tc_offset_div2 = 0;
+	pps.log2_parallel_merge_level_minus2 = 0;
+	// more here
+	pps.num_tile_columns_minus1 = 0;
+	pps.num_tile_rows_minus1 = 0;
+
+	pps.flags.dependent_slice_segments_enabled_flag = 0;
+	pps.flags.output_flag_present_flag = 0;
+	pps.flags.sign_data_hiding_enabled_flag = 0;
+	pps.flags.cabac_init_present_flag = 1;
+	pps.flags.constrained_intra_pred_flag = 0;
+	pps.flags.transform_skip_enabled_flag = 0;
+	pps.flags.cu_qp_delta_enabled_flag = 1;
+	pps.flags.pps_slice_chroma_qp_offsets_present_flag = 0;
+	pps.flags.weighted_pred_flag = 0;
+	pps.flags.weighted_bipred_flag = 0;
+	pps.flags.transquant_bypass_enabled_flag = 0; // TODO: true for lossless
+	pps.flags.tiles_enabled_flag = 0;
+	pps.flags.entropy_coding_sync_enabled_flag = 0;
+	pps.flags.uniform_spacing_flag = 0;
+	pps.flags.loop_filter_across_tiles_enabled_flag = 0;
+	pps.flags.pps_loop_filter_across_slices_enabled_flag = 1;
+	pps.flags.deblocking_filter_control_present_flag = 1;
+	pps.flags.pps_scaling_list_data_present_flag = 0;
+	pps.flags.lists_modification_present_flag = 0; // TODO: true for LTR
+	pps.flags.slice_segment_header_extension_present_flag = 0;
+	pps.flags.pps_extension_present_flag = 0;
+	pps.flags.cross_component_prediction_enabled_flag = 0;
+	pps.flags.chroma_qp_offset_list_enabled_flag = 0;
+	pps.flags.pps_curr_pic_ref_enabled_flag = 0;
+	pps.flags.residual_adaptive_colour_transform_enabled_flag = 0;
+	pps.flags.pps_slice_act_qp_offsets_present_flag = 0;
+	pps.flags.pps_palette_predictor_initializers_present_flag = 0;
+	pps.flags.monochrome_palette_flag = 0;
+	pps.flags.pps_range_extension_flag = 0;
+
+	if (impl.caps.h265.caps.stdSyntaxFlags & VK_VIDEO_ENCODE_H265_STD_TRANSFORM_SKIP_ENABLED_FLAG_SET_BIT_KHR
+		&& !(impl.caps.h265.caps.stdSyntaxFlags & VK_VIDEO_ENCODE_H265_STD_TRANSFORM_SKIP_ENABLED_FLAG_UNSET_BIT_KHR))
+		pps.flags.transform_skip_enabled_flag = 1;
+	if (impl.caps.h265.caps.stdSyntaxFlags & VK_VIDEO_ENCODE_H265_STD_ENTROPY_CODING_SYNC_ENABLED_FLAG_SET_BIT_KHR)
+		pps.flags.entropy_coding_sync_enabled_flag = 1;
+
+	// Initialize VUI
+	vui.flags.aspect_ratio_info_present_flag = 1;
+	// Aspect ratio of pixels (SAR), not actual aspect ratio. Confusing, I know.
+	vui.aspect_ratio_idc = STD_VIDEO_H265_ASPECT_RATIO_IDC_SQUARE;
+	// Sar or Sample Aspect Ratio is used to define the aspect ratio of a single pixel.
+	vui.sar_width = 1;
+	vui.sar_height = 0;
+	vui.video_format = 0;
+	//vui.video_format = 5; // Unspecified. The specified ones cover legacy PAL/NTSC, etc.
+	vui.flags.colour_description_present_flag = 1;
+	vui.colour_primaries = 1; // BT.709
+	vui.transfer_characteristics = 1; // BT.709
+	vui.matrix_coeffs = 1; // BT.709
+	// Center chroma siting would be a bit nicer,
+	// but NV drivers have a bug where they only write Left siting.
+	// Left siting is "standard", so it's more compatible to use that either way.
+	vui.flags.chroma_loc_info_present_flag = 1;
+	vui.chroma_sample_loc_type_bottom_field = 0;
+	vui.chroma_sample_loc_type_top_field = 0;
+
+	vui.def_disp_win_left_offset = 0;
+	vui.def_disp_win_bottom_offset = 0;
+	vui.def_disp_win_right_offset = 0;
+	vui.def_disp_win_top_offset = 0;
+
+	// Multiplying by 2 here since H.264 seems to imply "field rate", even for progressive scan.
+	// When playing back in ffplay, this makes it work as expected.
+	// mpv seems to make up its own timestamps, however.
+	// It is possible we may have to emit SEI packets on our own?
+	// Most likely our packets will be muxed into some sensible container which has its own timestamp mechanism.
+	vui.flags.vui_timing_info_present_flag = 1;
+	vui.vui_time_scale = impl.info.frame_rate_num * 2;
+	vui.vui_num_units_in_tick = impl.info.frame_rate_den;
+
+	vui.min_spatial_segmentation_idc = 0;
+	vui.max_bytes_per_pic_denom = 0;
+	vui.max_bits_per_min_cu_denom = 0;
+
+	// todo:
+	// vui.log2_max_mv_length_horizontal
+	vui.flags.vui_hrd_parameters_present_flag = 0;
+	vui.flags.neutral_chroma_indication_flag = 0;
+	// Indicates whether video is encoded as fields or frames. Set to 1 for interlaced video (not supported by HEVC).
+	vui.flags.field_seq_flag = 0;
+	// Required for interlaced.
+	vui.flags.frame_field_info_present_flag = 0;
+	vui.flags.default_display_window_flag = 0;
+	vui.flags.vui_poc_proportional_to_timing_flag = 0;
+	vui.flags.tiles_fixed_structure_flag = 0;
+	vui.flags.motion_vectors_over_pic_boundaries_flag = 1;
+	vui.flags.restricted_ref_pic_lists_flag = 1;
+	//vui.flags.fixed_frame_rate_flag = 1;
+	vui.flags.video_signal_type_present_flag = 1;
+	vui.flags.video_full_range_flag = 0;
+
+	VkVideoEncodeH265SessionParametersAddInfoKHR add_info =
+	{ VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_SESSION_PARAMETERS_ADD_INFO_KHR };
+
+	add_info.pStdVPSs = &vps;
+	add_info.pStdPPSs = &pps;
+	add_info.pStdSPSs = &sps;
+	add_info.stdVPSCount = 1;
+	add_info.stdPPSCount = 1;
+	add_info.stdSPSCount = 1;
+
+	h265_session_param_info.pParametersAddInfo = &add_info;
+	session_param_info.pNext = &h265_session_param_info;
+	session_param_info.videoSession = impl.session.session;
+
+	auto &table = impl.table;
+
+	// Simple rounding to nearest quality level.
+	quality_level.qualityLevel = uint32_t(saturate(impl.info.quality_level) *
+		float(impl.caps.encode_caps.maxQualityLevels - 1) + 0.5f);
+	h265_session_param_info.pNext = &quality_level;
+
+	// Query some properties for the quality level we chose.
+	VkPhysicalDeviceVideoEncodeQualityLevelInfoKHR quality_level_info =
+	{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_ENCODE_QUALITY_LEVEL_INFO_KHR };
+	quality_level_info.pVideoProfile = &impl.profile.profile_info;
+	quality_level_info.qualityLevel = quality_level.qualityLevel;
+	h265.quality_level_props = { VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_QUALITY_LEVEL_PROPERTIES_KHR };
+	quality_level_props.pNext = &h265.quality_level_props;
+	VK_CALL(vkGetPhysicalDeviceVideoEncodeQualityLevelPropertiesKHR(impl.info.gpu, &quality_level_info,
+		&quality_level_props));
+
+	// A low quality mode might opt for using CAVLC instead of CABAC.
+	/*if (!h264.quality_level_props.preferredStdEntropyCodingModeFlag &&
+		(impl.caps.h264.caps.stdSyntaxFlags & VK_VIDEO_ENCODE_H265_STD_ENTROPY_CODING_SYNC_ENABLED_FLAG_SET_BIT_KHR) != 0)
+	{
+		pps.flags.entropy_coding_mode_flag = 0;
+	}*/
+
+	if (VK_CALL(vkCreateVideoSessionParametersKHR(impl.info.device, &session_param_info,
+		nullptr, &params)) != VK_SUCCESS)
+	{
+		params = VK_NULL_HANDLE;
+		return false;
+	}
+
+	// Session Parameters Get Info
+	VkVideoEncodeH265SessionParametersGetInfoKHR h265_params_get_info = { 
+		.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_SESSION_PARAMETERS_GET_INFO_KHR,
+		.pNext = nullptr,
+		.writeStdVPS = VK_TRUE,
+		.writeStdSPS = VK_TRUE,
+		.writeStdPPS = VK_TRUE,
+		.stdVPSId = vpsId,
+		.stdSPSId = spsId,
+		.stdPPSId = ppsId
+	};
+	VkVideoEncodeSessionParametersGetInfoKHR params_get_info = { 
+		.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_SESSION_PARAMETERS_GET_INFO_KHR,
+		.pNext = &h265_params_get_info,
+		.videoSessionParameters = params
+	};
+
+	// Feedback Info
+	VkVideoEncodeH265SessionParametersFeedbackInfoKHR h265_feedback_info = { 
+		.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_SESSION_PARAMETERS_FEEDBACK_INFO_KHR,
+		.pNext = nullptr
+	};
+	VkVideoEncodeSessionParametersFeedbackInfoKHR feedback_info = { 
+		.sType = VK_STRUCTURE_TYPE_VIDEO_ENCODE_SESSION_PARAMETERS_FEEDBACK_INFO_KHR,
+		.pNext = &h265_feedback_info
+	};
+
+	// First call to get required size
+	size_t params_size = 0;
+	VK_CALL(vkGetEncodedVideoSessionParametersKHR(
+		impl.info.device,
+		&params_get_info,
+		&feedback_info,
+		&params_size,
+		nullptr));
+
+	// Allocate buffer with correct size
+	encoded_parameters.resize(params_size);
+
+	auto res = VK_CALL(vkGetEncodedVideoSessionParametersKHR(
+		impl.info.device, &params_get_info,
+		&feedback_info, &params_size, encoded_parameters.data()));
+
+	if (res != VK_SUCCESS)
+	{
+		// TODO: This is not handled well and leads to crash. Same in init_h264
+		VK_CALL(vkDestroyVideoSessionParametersKHR(impl.info.device, params, nullptr));
+		params = VK_NULL_HANDLE;
+	}
+
+	encoded_parameters.resize(params_size);
+	return true;
+}
+
 void VideoSessionParameters::destroy(Encoder::Impl &impl)
 {
 	auto &table = impl.table;
@@ -2111,6 +2727,11 @@ bool RateControl::init(Encoder::Impl &impl)
 	case Profile::H264_Main:
 	case Profile::H264_High:
 		is_h264 = true;
+		break;
+
+	case Profile::H265_Main:
+	case Profile::H265_Main10:
+		is_h264 = false;
 		break;
 
 	default:
@@ -2227,6 +2848,54 @@ bool RateControl::init(Encoder::Impl &impl)
 			h264.layer.minQp.qpB = 24;
 			h264.layer.maxQp.qpB = 40;
 #endif
+		}
+		else
+		{
+			// h265
+			rate_info.pNext = &h265.rate_control;
+			layer.pNext = &h265.layer;
+
+			h265.rate_control = { VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_RATE_CONTROL_INFO_KHR };
+			h265.layer = { VK_STRUCTURE_TYPE_VIDEO_ENCODE_H265_RATE_CONTROL_LAYER_INFO_KHR };
+
+			// If GOP is invalid, override it with some sensible defaults.
+			if (info.gop_frames == 0)
+				info.gop_frames = impl.session_params.h265.quality_level_props.preferredGopFrameCount;
+			if (info.gop_frames == 0)
+				info.gop_frames = 1;
+
+			h265.rate_control.consecutiveBFrameCount = 0;
+			h265.rate_control.idrPeriod = info.gop_frames;
+			h265.rate_control.gopFrameCount = info.gop_frames;
+			// VUID 07022 only says we have to set this if layerCount > 1, not if it's == 1.
+			// Seems to work fine.
+			//h265.rate_control.subLayerCount = 1;
+
+			// When we start using intra-refresh, we cannot use these.
+			if ((impl.session_params.h265.quality_level_props.preferredRateControlFlags &
+				VK_VIDEO_ENCODE_H265_RATE_CONTROL_REFERENCE_PATTERN_FLAT_BIT_KHR) != 0)
+			{
+				// VUID 02818. If REFERENCE_PATTERN_FLAT is used, REGULAR_GOP must also be set.
+				h265.rate_control.flags |= VK_VIDEO_ENCODE_H265_RATE_CONTROL_REGULAR_GOP_BIT_KHR |
+					VK_VIDEO_ENCODE_H265_RATE_CONTROL_REFERENCE_PATTERN_FLAT_BIT_KHR;
+			}
+			else if ((impl.session_params.h265.quality_level_props.preferredRateControlFlags &
+				VK_VIDEO_ENCODE_H265_RATE_CONTROL_REGULAR_GOP_BIT_KHR) != 0)
+			{
+				h265.rate_control.flags |= VK_VIDEO_ENCODE_H265_RATE_CONTROL_REGULAR_GOP_BIT_KHR;
+			}
+
+			// We don't consider dyadic patterns here. We don't use B-frames yet.
+
+			// Don't attempt HRD compliance since we're not emitting HRD data in SPS/PPS anyway.
+			//if (impl.caps.h264.caps.flags & VK_VIDEO_ENCODE_H264_CAPABILITY_HRD_COMPLIANCE_BIT_KHR)
+			//	h264.rate_control.flags |= VK_VIDEO_ENCODE_H264_RATE_CONTROL_ATTEMPT_HRD_COMPLIANCE_BIT_KHR;
+
+			// Might not be enough to ensure our payload buffer does not overflow.
+			h265.layer.useMaxFrameSize = VK_TRUE;
+			h265.layer.maxFrameSize.frameISize = MaxPayloadSize;
+			h265.layer.maxFrameSize.framePSize = MaxPayloadSize;
+			h265.layer.maxFrameSize.frameBSize = MaxPayloadSize;
 		}
 	}
 
