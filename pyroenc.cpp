@@ -2311,8 +2311,10 @@ bool VideoSessionParameters::init_h265(Encoder::Impl &impl)
 	// video sequence can be encoded at different temporal resolutions (sub-layers), allowing for 
 	// efficient playback at different frame rates or quality levels.
 	// Temporal sub-layers provide flexibility, such as enabling lower-quality streams by skipping 
-	// higher sub-layers during decoding.
-	constexpr auto MaxSubLayers = 0;
+	// higher sub-layers during decoding
+	// 1 sub layer indicates the base layer.
+	// TODO: If this is greater than 1, then there could be other params to change/expose related to layering in VPS.
+	constexpr auto MaxSubLayers = 1;
 
 	// The following specify the size of the smallest and biggest transform block for the luma(brightness) component in a frame.
 	// Transform blocks are used to apply transforms(like DCT or DST) for encoding the residual data after
@@ -2357,44 +2359,54 @@ bool VideoSessionParameters::init_h265(Encoder::Impl &impl)
 
 	// TODO: need to change this alignedWidth and alignedHeight elsewhere so that it aligns with MinCodingBlockSize
 	// For HEVC, the picture width needs to be aligned according to Vulkan video capabilities (pictureAccessGranularity) and minimum coding block size.
-	auto alignment = std::max(impl.caps.video_caps.pictureAccessGranularity.width, MinCodingBlockSize);
-	const auto alignedWidth = align_size(impl.info.width, alignment);
+	// Both should be powers of two so they need to be aligned to the max between the two.
+	auto picAlignment = std::max(impl.caps.video_caps.pictureAccessGranularity.width, MinCodingBlockSize);
+	const auto alignedWidth = align_size(impl.info.width, picAlignment);
 
-	alignment = std::max(impl.caps.video_caps.pictureAccessGranularity.height, MinCodingBlockSize);
-	const auto alignedHeight = align_size(impl.info.height, alignment);
+	picAlignment = std::max(impl.caps.video_caps.pictureAccessGranularity.height, MinCodingBlockSize);
+	const auto alignedHeight = align_size(impl.info.height, picAlignment);
 
-	// Initialize VPS
-	vps.vps_video_parameter_set_id = vpsId;
-	// H.265/HEVC supports a hierarchical temporal scalability mechanism. This means frames in a 
-	// video sequence can be encoded at different temporal resolutions (sub-layers), allowing for 
-	// efficient playback at different frame rates or quality levels.
-	// Temporal sub-layers provide flexibility, such as enabling lower-quality streams by skipping 
-	// higher sub-layers during decoding.
-	vps.vps_max_sub_layers_minus1 = MaxSubLayers;
-	// Frame duration = num_units_per_tick / time_scale
-	// Frame rate =  time_scale / num_units_per_tick
-	// This can also be set at the level of VUI.
-	vps.vps_num_units_in_tick = 0;
-	vps.vps_time_scale = 0;
-	// This is for decoding of POC (which is used with b frames when frames are encoded out of order).
-	// POC is an integer value that represents the display order of a frame within the video sequence. 
-	// It is used by decoders to correctly reorder frames for playback, particularly in streams with B-frames or other non-linear coding orders.
-	vps.vps_num_ticks_poc_diff_one_minus1 = 0;
-	// Temporal scalability allows encoding multiple sub-layers, each representing a different frame rate or temporal resolution.
-	// Nesting ensures that lower temporal sub-layers (e.g., lower frame rate) can be decoded independently of higher temporal sub-layers.
-	// we are not working with temporarl sublayers, but setting it to 1 is fine i think.
-	vps.flags.vps_temporal_id_nesting_flag = 1;
-	// Specifies whether is ordering info in sublayers (but we are not using sublayers).
-	vps.flags.vps_sub_layer_ordering_info_present_flag = 0;
-	// vps_timing_info_present_flag says whether to consider timing info like vps_num_units_in_tick and vps_time_scale
-	vps.flags.vps_timing_info_present_flag = 0;
-	// This indicates whether the Picture Order Count (POC) is proportional to the timing (or the time axis) for the video sequence.
-	// If this flag is set to 1, the POC values are proportional to the time axis (i.e., frames are ordered based on their presentation time).
-	vps.flags.vps_poc_proportional_to_timing_flag = 1;
-	// Probably a better place to initialize this..
+	// There is not a great place to initialize this.
 	impl.profile.h265.profile_tier_level.general_level_idc = impl.caps.h265.caps.maxLevelIdc;
-	vps.pProfileTierLevel = &impl.profile.h265.profile_tier_level;
-	// TODO set StdVideoH265HrdParameters? in vps.pHrdParameters
+	
+	// Initialize VPS
+	vps = {
+		.flags = {},
+		.vps_video_parameter_set_id = vpsId,
+		.vps_max_sub_layers_minus1 = MaxSubLayers - 1,
+		.reserved1 = 0,
+		.reserved2 = 0,
+		// Frame duration = num_units_per_tick / time_scale
+		// Frame rate =  time_scale / num_units_per_tick
+		.vps_num_units_in_tick = impl.info.frame_rate_den,
+		// Possible issue: with h264, we multiply the frame_rate_num by 2 here to make it work as suspected.
+		.vps_time_scale = impl.info.frame_rate_num,
+		// This is for decoding of POC (which is used with b frames when frames are encoded out of order).
+		// POC is an integer value that represents the display order of a frame within the video sequence. 
+		// It is used by decoders to correctly reorder frames for playback, particularly in streams with B-frames or other non-linear coding orders.
+		.vps_num_ticks_poc_diff_one_minus1 = 0,
+		.reserved3 = 0,
+		.pDecPicBufMgr = nullptr,
+		.pHrdParameters = nullptr,
+		.pProfileTierLevel = &impl.profile.h265.profile_tier_level
+	};
+
+	StdVideoH265VpsFlags vpsFlags = {
+		// Temporal scalability allows encoding multiple sub-layers, each representing a different frame rate or temporal resolution.
+		// Nesting ensures that lower temporal sub-layers (e.g., lower frame rate) can be decoded independently of higher temporal sub-layers.
+		// In the case that we are not using sub-layers (vps_max_sub_layers_minus1 = 0, indicating there is only a single temporal layer i.e. the base layer),
+		// temporal nesting is always enforced by definition, so set the flag to 1.
+		.vps_temporal_id_nesting_flag = 1,
+		// Specifies whether is ordering info in sublayers (but we are not using sublayers).
+		.vps_sub_layer_ordering_info_present_flag = 0,
+		// vps_timing_info_present_flag says whether to consider timing info like vps_num_units_in_tick and vps_time_scale
+		.vps_timing_info_present_flag = vps.vps_num_units_in_tick != 0 || vps.vps_time_scale != 0,
+		// This indicates whether the Picture Order Count (POC) is proportional to the timing (or the time axis) for the video sequence.
+		// If this flag is set to 1, the POC values are proportional to the time axis (i.e., frames are ordered based on their presentation time).
+		.vps_poc_proportional_to_timing_flag = 1
+	};
+
+	vps.flags = vpsFlags;
 
 	// Initialize SPS
 	if (impl.profile.profile_info.chromaSubsampling == VK_VIDEO_CHROMA_SUBSAMPLING_420_BIT_KHR)
@@ -2552,9 +2564,8 @@ bool VideoSessionParameters::init_h265(Encoder::Impl &impl)
 	vui.aspect_ratio_idc = STD_VIDEO_H265_ASPECT_RATIO_IDC_SQUARE;
 	// Sar or Sample Aspect Ratio is used to define the aspect ratio of a single pixel.
 	vui.sar_width = 1;
-	vui.sar_height = 0;
-	vui.video_format = 0;
-	//vui.video_format = 5; // Unspecified. The specified ones cover legacy PAL/NTSC, etc.
+	vui.sar_height = 1;
+	vui.video_format = 5; // Unspecified. The specified ones cover legacy PAL/NTSC, etc.
 	vui.flags.colour_description_present_flag = 1;
 	vui.colour_primaries = 1; // BT.709
 	vui.transfer_characteristics = 1; // BT.709
@@ -2577,8 +2588,8 @@ bool VideoSessionParameters::init_h265(Encoder::Impl &impl)
 	// It is possible we may have to emit SEI packets on our own?
 	// Most likely our packets will be muxed into some sensible container which has its own timestamp mechanism.
 	vui.flags.vui_timing_info_present_flag = 1;
-	vui.vui_time_scale = impl.info.frame_rate_num * 2;
-	vui.vui_num_units_in_tick = impl.info.frame_rate_den;
+	vui.vui_time_scale = vps.vps_time_scale;
+	vui.vui_num_units_in_tick = vps.vps_num_units_in_tick;
 
 	vui.min_spatial_segmentation_idc = 0;
 	vui.max_bytes_per_pic_denom = 0;
@@ -2675,17 +2686,24 @@ bool VideoSessionParameters::init_h265(Encoder::Impl &impl)
 
 	// First call to get required size
 	size_t params_size = 0;
-	VK_CALL(vkGetEncodedVideoSessionParametersKHR(
+	auto res = VK_CALL(vkGetEncodedVideoSessionParametersKHR(
 		impl.info.device,
 		&params_get_info,
 		&feedback_info,
 		&params_size,
 		nullptr));
 
+	if (res != VK_SUCCESS)
+	{
+		// TODO: This is not handled well and leads to crash. Same in init_h264
+		VK_CALL(vkDestroyVideoSessionParametersKHR(impl.info.device, params, nullptr));
+		params = VK_NULL_HANDLE;
+	}
+
 	// Allocate buffer with correct size
 	encoded_parameters.resize(params_size);
 
-	auto res = VK_CALL(vkGetEncodedVideoSessionParametersKHR(
+	res = VK_CALL(vkGetEncodedVideoSessionParametersKHR(
 		impl.info.device, &params_get_info,
 		&feedback_info, &params_size, encoded_parameters.data()));
 
@@ -2696,7 +2714,7 @@ bool VideoSessionParameters::init_h265(Encoder::Impl &impl)
 		params = VK_NULL_HANDLE;
 	}
 
-	encoded_parameters.resize(params_size);
+	//encoded_parameters.resize(params_size);
 	return true;
 }
 
