@@ -4,6 +4,7 @@
 #include "pyroenc.hpp"
 #include <atomic>
 #include <utility>
+#include <array>
 #include <vector>
 #include <queue>
 #include <assert.h>
@@ -178,6 +179,11 @@ struct VideoSessionParameters
 			// Holds Vulkan-specific information about quality levels for H.265 encoding.
 			// Allows configuration of quality trade-offs (e.g., compression efficiency vs. speed).
 			VkVideoEncodeH265QualityLevelPropertiesKHR quality_level_props;
+			// Short-term reference pictures are previously encoded immediate past frames used to predict (encode or decode) subsequent frames.
+			// A reference picture set (RPS) defines a group of reference frames, indicating:
+			// - Which frames are available for referencing.
+			// - How to handle temporal relationships between frames.
+			std::array<StdVideoH265ShortTermRefPicSet, 1> short_term_ref_pic_sets;
 		} h265;
 	};
 
@@ -2357,14 +2363,14 @@ bool VideoSessionParameters::init_h265(Encoder::Impl &impl)
 	sps = {};
 	vui = {};
 
-	// TODO: need to change this alignedWidth and alignedHeight elsewhere so that it aligns with MinCodingBlockSize
+	// TODO: need to change this aligned_pic_width and aligned_pic_height elsewhere so that it aligns with MinCodingBlockSize
 	// For HEVC, the picture width needs to be aligned according to Vulkan video capabilities (pictureAccessGranularity) and minimum coding block size.
 	// Both should be powers of two so they need to be aligned to the max between the two.
-	auto picAlignment = std::max(impl.caps.video_caps.pictureAccessGranularity.width, MinCodingBlockSize);
-	const auto alignedWidth = align_size(impl.info.width, picAlignment);
+	auto pic_alignment = std::max(impl.caps.video_caps.pictureAccessGranularity.width, MinCodingBlockSize);
+	const auto aligned_pic_width = align_size(impl.info.width, pic_alignment);
 
-	picAlignment = std::max(impl.caps.video_caps.pictureAccessGranularity.height, MinCodingBlockSize);
-	const auto alignedHeight = align_size(impl.info.height, picAlignment);
+	pic_alignment = std::max(impl.caps.video_caps.pictureAccessGranularity.height, MinCodingBlockSize);
+	const auto aligned_pic_height = align_size(impl.info.height, pic_alignment);
 
 	// There is not a great place to initialize this.
 	impl.profile.h265.profile_tier_level.general_level_idc = impl.caps.h265.caps.maxLevelIdc;
@@ -2374,8 +2380,6 @@ bool VideoSessionParameters::init_h265(Encoder::Impl &impl)
 		.flags = {},
 		.vps_video_parameter_set_id = vpsId,
 		.vps_max_sub_layers_minus1 = MaxSubLayers - 1,
-		.reserved1 = 0,
-		.reserved2 = 0,
 		// Frame duration = num_units_per_tick / time_scale
 		// Frame rate =  time_scale / num_units_per_tick
 		.vps_num_units_in_tick = impl.info.frame_rate_den,
@@ -2385,13 +2389,12 @@ bool VideoSessionParameters::init_h265(Encoder::Impl &impl)
 		// POC is an integer value that represents the display order of a frame within the video sequence. 
 		// It is used by decoders to correctly reorder frames for playback, particularly in streams with B-frames or other non-linear coding orders.
 		.vps_num_ticks_poc_diff_one_minus1 = 0,
-		.reserved3 = 0,
 		.pDecPicBufMgr = nullptr,
 		.pHrdParameters = nullptr,
 		.pProfileTierLevel = &impl.profile.h265.profile_tier_level
 	};
 
-	StdVideoH265VpsFlags vpsFlags = {
+	StdVideoH265VpsFlags vps_flags = {
 		// Temporal scalability allows encoding multiple sub-layers, each representing a different frame rate or temporal resolution.
 		// Nesting ensures that lower temporal sub-layers (e.g., lower frame rate) can be decoded independently of higher temporal sub-layers.
 		// In the case that we are not using sub-layers (vps_max_sub_layers_minus1 = 0, indicating there is only a single temporal layer i.e. the base layer),
@@ -2406,98 +2409,175 @@ bool VideoSessionParameters::init_h265(Encoder::Impl &impl)
 		.vps_poc_proportional_to_timing_flag = 1
 	};
 
-	vps.flags = vpsFlags;
+	vps.flags = vps_flags;
 
 	// Initialize SPS
-	if (impl.profile.profile_info.chromaSubsampling == VK_VIDEO_CHROMA_SUBSAMPLING_420_BIT_KHR)
-		sps.chroma_format_idc = STD_VIDEO_H265_CHROMA_FORMAT_IDC_420;
-	else if (impl.profile.profile_info.chromaSubsampling == VK_VIDEO_CHROMA_SUBSAMPLING_422_BIT_KHR)
-		sps.chroma_format_idc = STD_VIDEO_H265_CHROMA_FORMAT_IDC_422;
-	else
-		sps.chroma_format_idc = STD_VIDEO_H265_CHROMA_FORMAT_IDC_444;
+	StdVideoH265ChromaFormatIdc chroma_format;
+	switch (impl.profile.profile_info.chromaSubsampling)
+	{
+	case VK_VIDEO_CHROMA_SUBSAMPLING_420_BIT_KHR:
+		chroma_format = STD_VIDEO_H265_CHROMA_FORMAT_IDC_420;
+		break;
+	case VK_VIDEO_CHROMA_SUBSAMPLING_422_BIT_KHR:
+		chroma_format = STD_VIDEO_H265_CHROMA_FORMAT_IDC_422;
+		break;
+	default:
+		chroma_format = STD_VIDEO_H265_CHROMA_FORMAT_IDC_444;
+		break;
+	}
 
-	// Luma samples are not subsampled like chroma so the following parameters will always be equal to pixel width/height.
-	sps.pic_width_in_luma_samples = alignedWidth;
-	sps.pic_height_in_luma_samples = alignedHeight;
-	sps.sps_video_parameter_set_id = vpsId;
-	// This is defined at the video level. Check vps.vps_max_sub_layers_minus1
-	sps.sps_max_sub_layers_minus1 = 0;
-	sps.sps_seq_parameter_set_id = spsId;
+	// In chroma subsampling 4:2:0 and 4:2:2 each of the two chroma arrays (Cb and Cr) has half the width of the luma array.
+	const auto sub_width_c = (chroma_format == STD_VIDEO_H265_CHROMA_FORMAT_IDC_420 || chroma_format == STD_VIDEO_H265_CHROMA_FORMAT_IDC_422) ? 2 : 1;
+	// In chroma subsampling 4:2:0 each of the two chroma arrays (Cb and Cr) has half the height of the luma array.
+	const auto sub_height_c = chroma_format == STD_VIDEO_H265_CHROMA_FORMAT_IDC_420 ? 2 : 1;
 
-	if (impl.profile.profile_info.lumaBitDepth == VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR)
-		sps.bit_depth_luma_minus8 = 0; // 8-bit luma
-	else if (impl.profile.profile_info.chromaBitDepth == VK_VIDEO_COMPONENT_BIT_DEPTH_10_BIT_KHR)
-		sps.bit_depth_luma_minus8 = 2; // 10-bit luma
+	uint8_t bit_depth_luma = 8;
+	 if (impl.profile.profile_info.lumaBitDepth == VK_VIDEO_COMPONENT_BIT_DEPTH_10_BIT_KHR)
+		bit_depth_luma = 10;
+	else if (impl.profile.profile_info.lumaBitDepth == VK_VIDEO_COMPONENT_BIT_DEPTH_12_BIT_KHR)
+		bit_depth_luma = 12;
 
-	if (impl.profile.profile_info.chromaBitDepth == VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR)
-		sps.bit_depth_chroma_minus8 = 0; // 8-bit chroma
-	else if (impl.profile.profile_info.chromaBitDepth == VK_VIDEO_COMPONENT_BIT_DEPTH_10_BIT_KHR)
-		sps.bit_depth_chroma_minus8 = 2; // 10-bit chroma
+	uint8_t bit_depth_chroma = 8;
+	if (impl.profile.profile_info.chromaBitDepth == VK_VIDEO_COMPONENT_BIT_DEPTH_10_BIT_KHR)
+		bit_depth_chroma = 10;
+	else if (impl.profile.profile_info.chromaBitDepth == VK_VIDEO_COMPONENT_BIT_DEPTH_12_BIT_KHR)
+		bit_depth_chroma = 12;
 
-	// This is used for the POC (picture order count)
-	// The Picture Order Count (POC) is a number that indicates the display order of a frame in the video timeline:
-	// Even though frames may be encoded out of order (e.g., B-frames in inter-frame prediction), the POC ensures that decoders can reconstruct the correct display sequence.
-	// This parameter defines the number of bits used for the LSB portion of the POC. Since the POC value may get very large 
-	// (depending on the length of the video sequence), the standard uses a wrap-around mechanism to save bits. Only the Least Significant Bits (LSB) of the POC are transmitted.
-	// Wrap-around: 
-	// The LSB portion wraps around after reaching its maximum value (2^log2_max_pic_order_cnt_lsb - 1), reducing the amount of data needed to represent POC values.
-	// Best to initilize even if POC won't be used apparently.
-	sps.log2_max_pic_order_cnt_lsb_minus4 = 8;
-	// Note that 8x8 is the minimum coding block size for luma.
-	// Luma coding block size = 2^(log2_min_luma_coding_block_size_minus3 + 3)
-	sps.log2_min_luma_coding_block_size_minus3 = MinCodingBlockLog2Size - 3;
-	// Note that 64x64 is the maximum coding block size for luma.
-	// Max Luma Coding Block Size = 2^(log2_min_luma_coding_block_size_minus3 + 3 + log2_diff_max_min_luma_coding_block_size)
-	sps.log2_diff_max_min_luma_coding_block_size = CodingTreeBlockLog2Size - MinCodingBlockLog2Size;
-	// Transform blocks are used to apply transforms(like DCT or DST) for encoding the residual data after motion prediction and intra prediction.
-	// Min transform block size = 2^(log2_min_luma_transform_block_size_minus2 + 2)
-	sps.log2_min_luma_transform_block_size_minus2 = MinTransformBlockLog2Size - 2;
-	// Max transform block size = 2^(log2_min_luma_transform_block_size_minus2 + 2 + log2_diff_max_min_luma_transform_block_size)
-	sps.log2_diff_max_min_luma_transform_block_size = MaxTransformBlockLog2Size - MinTransformBlockLog2Size;
-	// TODO: Maybe these could vary in terms of desired quality?
-	// Transform blocks are derived by subdiving Coding Tree Blocks.
-	// The depth controls how many times the CTB can be recursively subdivided (by 2) into smaller Transform Blocks (TBs) for encoding the residual signal.
-	sps.max_transform_hierarchy_depth_inter = uint8_t(std::max(CodingTreeBlockLog2Size - MinTransformBlockLog2Size, 1));
-	// Intra-predicted blocks are blocks predicted within the same frame (e.g. for I Frames).
-	// Inter-predicted blocks are blocks predicted using motion compensation from other frames (e.g. P Frames and B Frames).
-	sps.max_transform_hierarchy_depth_intra = uint8_t(std::max(CodingTreeBlockLog2Size - MinTransformBlockLog2Size, 1));
+	// Only configure one for now
+	auto &short_term_ref_pic_set = h265.short_term_ref_pic_sets[0];
+	short_term_ref_pic_set = {
+		.flags = {
+			.inter_ref_pic_set_prediction_flag = 0,
+			.delta_rps_sign = 0
+		},
+		.delta_idx_minus1 = 0,
+		.abs_delta_rps_minus1 = 0,
+		.used_by_curr_pic_flag = 0,
+		// This reference will be used by current picture
+		.used_by_curr_pic_s0_flag = 1,
+		.used_by_curr_pic_s1_flag = 0,
+		// Using 1 picture with negative POC difference (previous frame)
+		.num_negative_pics = 1,
+		// Not using any pictures with positive POC difference
+		.num_positive_pics = 0,
+		// Reference the previous frame (POC = current_poc - 1)
+		.delta_poc_s0_minus1 = { 0 },
+		.delta_poc_s1_minus1 = 0
+	};
 
-	// Short-term reference pictures are previously encoded immediate past frames used to predict (encode or decode) subsequent frames.
-	// A reference picture set (RPS) defines a group of reference frames, indicating:
-	// Which frames are available for referencing.
-	// How to handle temporal relationships between frames.
-	sps.num_short_term_ref_pic_sets = MaxActiveReferencePictures > 0 ? 1 : 0;
-	// Long-term reference pictures are used to maintain a reference frame for a longer period, used particularly for sequences
-	// with inter-frame prediction. Used often when creating B-frames.
-	sps.num_long_term_ref_pics_sps = 0;
-	sps.pcm_sample_bit_depth_luma_minus1 = 8 - 1;
-	sps.pcm_sample_bit_depth_chroma_minus1 = 8 - 1;
-	// The smallest possible luma coding block size in the video.
-	// PCM (Picture Coding Mode): this refers to a coding mode where pixel data is encoded directly, without using transforms like
-	// the Discrete Cosine Transform (DCT). Typically used for parts of a video frame where high fidelity is required.
-	sps.log2_min_pcm_luma_coding_block_size_minus3 = MinCodingBlockLog2Size - 3;
-	sps.log2_diff_max_min_pcm_luma_coding_block_size = CodingTreeBlockLog2Size - MinCodingBlockLog2Size;
+	StdVideoH265SpsFlags sps_flags = {
+		// When vps_temporal_id_nesting_flag is 1, then sps_temporal_id_nesting_flag should be 1
+		.sps_temporal_id_nesting_flag = 1,
+		.separate_colour_plane_flag = 0,
+		.conformance_window_flag = 1,
+		.sps_sub_layer_ordering_info_present_flag = 0,
+		.scaling_list_enabled_flag = 0,
+		.sps_scaling_list_data_present_flag = 0,
+		// Enable asymmetric motion partitioning
+		.amp_enabled_flag = 1,
+		// Enable SAO filtering
+		.sample_adaptive_offset_enabled_flag = 1,
+		.pcm_enabled_flag = 0,
+		.pcm_loop_filter_disabled_flag = 0,
+		.long_term_ref_pics_present_flag = 0,
+		// Enable temporal motion vector prediction
+		.sps_temporal_mvp_enabled_flag = 1,
+		// Enable strong intra smoothing for 32x32 blocks
+		.strong_intra_smoothing_enabled_flag = 1,
+		.vui_parameters_present_flag = 1,
+		.sps_extension_present_flag = 0,
+		.sps_range_extension_flag = 0,
+		.transform_skip_rotation_enabled_flag = 0,
+		.transform_skip_context_enabled_flag = 0,
+		.implicit_rdpcm_enabled_flag = 0,
+		.explicit_rdpcm_enabled_flag = 0,
+		.extended_precision_processing_flag = 0,
+		.intra_smoothing_disabled_flag = 0,
+		.high_precision_offsets_enabled_flag = 0,
+		.persistent_rice_adaptation_enabled_flag = 0,
+		.cabac_bypass_alignment_enabled_flag = 0,
+		.sps_scc_extension_flag = 0,
+		.sps_curr_pic_ref_enabled_flag = 0,
+		.palette_mode_enabled_flag = 0,
+		.sps_palette_predictor_initializers_present_flag = 0,
+		.intra_boundary_filtering_disabled_flag = 0,
+	};
 
-	// TODO.
-	// Ensure that these parameters are set to crop any padded regions while still aligning with pictureAccessGranularity.
-	sps.conf_win_left_offset = 0;
-	sps.conf_win_bottom_offset = 0;
-	sps.conf_win_right_offset = 0;
-	sps.conf_win_top_offset = 0;
-	sps.pProfileTierLevel = &impl.profile.h265.profile_tier_level;
-	sps.pSequenceParameterSetVui = &vui;
-	// TODO MAYBE?
-	// sps.pShortTermRefPicSet = nullptr;
-
-	sps.flags.sps_sub_layer_ordering_info_present_flag = 0;
-	sps.flags.sps_scaling_list_data_present_flag = 0;
-	sps.flags.scaling_list_enabled_flag = 0;
-	sps.flags.long_term_ref_pics_present_flag = 0;
-	sps.flags.sps_palette_predictor_initializers_present_flag = 0;
-	sps.flags.sps_extension_present_flag = 0;
-	sps.flags.sample_adaptive_offset_enabled_flag = 1;
-	sps.flags.sps_temporal_mvp_enabled_flag = 1;
-	sps.flags.vui_parameters_present_flag = 1;
+	sps = {
+		.flags = sps_flags,
+		.chroma_format_idc = chroma_format,
+		// Luma samples are not subsampled like chroma so the following parameters will always be equal to pixel width/height.
+		.pic_width_in_luma_samples = aligned_pic_width,
+		.pic_height_in_luma_samples = aligned_pic_height,
+		.sps_video_parameter_set_id = vpsId,
+		.sps_max_sub_layers_minus1 = MaxSubLayers - 1,
+		.sps_seq_parameter_set_id = spsId,
+		.bit_depth_luma_minus8 = uint8_t(bit_depth_luma - 8),
+		.bit_depth_chroma_minus8 = uint8_t(bit_depth_chroma - 8),
+		// This is used for the POC (picture order count), which is a number that indicates the display order of a frame in the video timeline:
+		// This parameter defines the number of bits used for the LSB portion of the POC. Since the POC value may get very large 
+		// (depending on the length of the video sequence), the standard uses a wrap-around mechanism to save bits. Only the Least Significant Bits (LSB)
+		// of the POC are transmitted.
+		// Best to initilize even if POC won't be used apparently.
+		.log2_max_pic_order_cnt_lsb_minus4 = 8,
+		// Note that 8x8 is the minimum coding block size for luma.
+		// Luma coding block size = 2^(log2_min_luma_coding_block_size_minus3 + 3)
+		.log2_min_luma_coding_block_size_minus3 = uint8_t(MinCodingBlockLog2Size - 3),
+		// Note that 64x64 is the maximum coding block size for luma.
+		// Max Luma Coding Block Size = 2^(log2_min_luma_coding_block_size_minus3 + 3 + log2_diff_max_min_luma_coding_block_size)
+		// A coding tree block is the biggest possible coding block which can contain other coding blocks.
+		.log2_diff_max_min_luma_coding_block_size = uint8_t(CodingTreeBlockLog2Size - MinCodingBlockLog2Size),
+		// Transform blocks are used to apply transforms (like DCT or DST) for encoding the residual data after motion prediction and intra prediction.
+		// Min transform block size = 2^(log2_min_luma_transform_block_size_minus2 + 2)
+		.log2_min_luma_transform_block_size_minus2 = uint8_t(MinTransformBlockLog2Size - 2),
+		// Max transform block size = 2^(log2_min_luma_transform_block_size_minus2 + 2 + log2_diff_max_min_luma_transform_block_size)
+		.log2_diff_max_min_luma_transform_block_size = uint8_t(MaxTransformBlockLog2Size - MinTransformBlockLog2Size),
+		// TODO: Maybe these could vary in terms of desired quality?
+		// Transform blocks are derived by subdiving Coding Tree Blocks.
+		// The depth controls how many times the CTB can be recursively subdivided (by 2) into smaller Transform Blocks (TBs) for encoding the residual signal.
+		.max_transform_hierarchy_depth_inter = uint8_t(std::max(CodingTreeBlockLog2Size - MinTransformBlockLog2Size, 1)),
+		// Intra-predicted blocks are blocks predicted within the same frame (e.g. for I Frames).
+		// Inter-predicted blocks are blocks predicted using motion compensation from other frames (e.g. P Frames and B Frames).
+		.max_transform_hierarchy_depth_intra = uint8_t(std::max(CodingTreeBlockLog2Size - MinTransformBlockLog2Size, 1)),
+		// Short-term reference pictures are previously encoded immediate past frames used to predict (encode or decode) subsequent frames.
+		// A reference picture set (RPS) defines a group of reference frames, indicating:
+		// - Which frames are available for referencing.
+		// - How to handle temporal relationships between frames.
+		.num_short_term_ref_pic_sets = uint8_t(h265.short_term_ref_pic_sets.size()),	
+		// Long-term reference pictures are used to maintain a reference frame for a longer period, used particularly for sequences
+		// with inter-frame prediction. Used often when creating B-frames.
+		.num_long_term_ref_pics_sps = 0,
+		// bit_depth_luma_minus8 controls bit depth for normal (compressed) luma samples
+		// this parameter controls bit depth for PCM (uncompressed) luma samples in PCM coded parts of the video.
+		// a PCM region stores the raw pixel values without transform coding, prediction (intra or inter), quantization or entropy coding.
+		.pcm_sample_bit_depth_luma_minus1 = uint8_t(bit_depth_luma - 1),
+		.pcm_sample_bit_depth_chroma_minus1 = uint8_t(bit_depth_chroma - 1),
+		// The smallest possible luma coding block size in the video.
+		.log2_min_pcm_luma_coding_block_size_minus3 = uint8_t(MinCodingBlockLog2Size - 3),
+		.log2_diff_max_min_pcm_luma_coding_block_size = uint8_t(CodingTreeBlockLog2Size - MinCodingBlockLog2Size),
+		// Not sure about these
+		.palette_max_size = 0,
+		.delta_palette_max_predictor_size = 0,
+		.motion_vector_resolution_control_idc = 0,
+		.sps_num_palette_predictor_initializers_minus1 = 0,
+		// The conformance cropping window corresponds to the actual desired display area, e.g. the area without 
+		// the padding bytes that were needed by hardware during encoding process for alignment.
+		// The conformance cropping window contains the luma samples with horizontal picture coordinates from
+		// sub_width_c * conf_win_left_offset to pic_width_in_luma_samples - (sub_width_c * conf_win_right_offset + 1)
+		// and vertical picture coordinates from sub_height_c * conf_win_top_offset to pic_height_in_luma_samples - (sub_height_c * conf_win_bottom_offset + 1)
+		// TODO: not sure if alignment padding is added to the left, right, top, bottom.
+		.conf_win_left_offset = 0,
+		.conf_win_right_offset = (aligned_pic_width - impl.info.width) / sub_width_c,
+		.conf_win_top_offset = 0,
+		.conf_win_bottom_offset = (aligned_pic_height - impl.info.height) / sub_height_c,
+		.pProfileTierLevel = &impl.profile.h265.profile_tier_level,
+		.pDecPicBufMgr = nullptr,
+		.pScalingLists = nullptr,
+		.pShortTermRefPicSet = &short_term_ref_pic_set,
+		.pLongTermRefPicsSps = nullptr,
+		.pSequenceParameterSetVui = &vui,
+		.pPredictorPaletteEntries = nullptr
+	};
 	
 	// Initialize PPS
 	pps.pps_pic_parameter_set_id = ppsId;
