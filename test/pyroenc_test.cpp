@@ -12,24 +12,44 @@ using namespace Vulkan;
 
 int main(int argc, char *argv[])
 {
-	if (argc != 7)
+	if (argc != 8)
 	{
-		LOGE("Usage: pyroenc-test <path.h264> <path to raw RGBA> <width> <height> <fps> <bitrate-kbits>\n");
+		LOGE("Usage: pyroenc-test <h264/h265> <path.h264/h265> <path to raw RGBA> <width> <height> <fps> <bitrate-kbits>\n");
 		return EXIT_FAILURE;
 	}
 
-	LOGI("Opening raw RGBA input: %s\n", argv[2]);
-	FILE *input = fopen(argv[2], "rb");
+	enum class codec
+	{
+		invalid,
+		h264,
+		h265
+	};
+
+	codec codec = codec::invalid;
+
+	if (argv[1] == std::string("h264"))
+		codec = codec::h264;
+	else if (argv[1] == std::string("h265"))
+		codec = codec::h265;
+	
+	if(codec == codec::invalid)
+	{
+		LOGE("Please specify h264 or h265 as first argument. Got %s\n", argv[1]);
+		return EXIT_FAILURE;
+	}
+
+	LOGI("Opening raw RGBA input: %s\n", argv[3]);
+	FILE *input = fopen(argv[3], "rb");
 	if (!input)
 	{
-		LOGE("Failed to open: %s\n", argv[2]);
+		LOGE("Failed to open: %s\n", argv[3]);
 		return EXIT_FAILURE;
 	}
 
-	unsigned width = strtoul(argv[3], nullptr, 0);
-	unsigned height = strtoul(argv[4], nullptr, 0);
-	unsigned fps = strtoul(argv[5], nullptr, 0);
-	unsigned kbits = strtoul(argv[6], nullptr, 0);
+	unsigned width = strtoul(argv[4], nullptr, 0);
+	unsigned height = strtoul(argv[5], nullptr, 0);
+	unsigned fps = strtoul(argv[6], nullptr, 0);
+	unsigned kbits = strtoul(argv[7], nullptr, 0);
 	if (width == 0 || height == 0 || fps == 0 || kbits == 0)
 	{
 		LOGE("Width, height or FPS are invalid.\n");
@@ -46,7 +66,7 @@ int main(int argc, char *argv[])
 	const char *ext = VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME;
 	if (!ctx.init_instance_and_device(nullptr, 0, &ext, 1,
 	                                  CONTEXT_CREATION_ENABLE_VIDEO_ENCODE_BIT |
-	                                  CONTEXT_CREATION_ENABLE_VIDEO_H264_BIT))
+	                                  (codec == codec::h264 ? CONTEXT_CREATION_ENABLE_VIDEO_H264_BIT : CONTEXT_CREATION_ENABLE_VIDEO_H265_BIT)))
 	{
 		LOGE("Failed to create context.\n");
 		return EXIT_FAILURE;
@@ -55,9 +75,14 @@ int main(int argc, char *argv[])
 	Device dev;
 	dev.set_context(ctx);
 
-	if (!dev.get_device_features().supports_video_encode_h264)
+	if (codec == codec::h264 && !dev.get_device_features().supports_video_encode_h264)
 	{
 		LOGE("Device does not support H.264 encode.\n");
+		return EXIT_FAILURE;
+	}
+	if (codec == codec::h265 && !dev.get_device_features().supports_video_encode_h265)
+	{
+		LOGE("Device does not support H.265 encode.\n");
 		return EXIT_FAILURE;
 	}
 
@@ -68,7 +93,7 @@ int main(int argc, char *argv[])
 	info.get_instance_proc_addr = Context::get_instance_proc_addr();
 	info.width = width;
 	info.height = height;
-	info.profile = Profile::H264_High;
+	info.profile = codec == codec::h264 ? Profile::H264_High : Profile::H265_Main;
 	info.quality_level = 1.0f;
 
 	info.encode_queue.queue =
@@ -103,8 +128,8 @@ int main(int argc, char *argv[])
 	frame.width = img->get_width();
 	frame.height = img->get_height();
 
-	LOGI("Opening %s for encode output.\n", argv[1]);
-	FILE *file = fopen(argv[1], "wb");
+	LOGI("Opening %s for encode output.\n", argv[2]);
+	FILE *file = fopen(argv[2], "wb");
 
 	RateControlInfo rate_info = {};
 	rate_info.mode = RateControlMode::CBR;
