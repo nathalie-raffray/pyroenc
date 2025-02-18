@@ -1130,7 +1130,7 @@ void H264EncodeInfo::setup(
 	pic.flags.IdrPicFlag = is_idr ? 1 : 0;
 	pic.flags.is_reference = 1;
 	if (is_idr)
-		pic.idr_pic_id = rate.idr_pic_id++;
+		pic.idr_pic_id = uint16_t(rate.idr_pic_id++);
 	pic.pRefLists = &ref_lists;
 
 	slice.pStdSliceHeader = &slice_header;
@@ -1381,6 +1381,8 @@ bool Encoder::Impl::record_and_submit_encode(VkCommandBuffer cmd, Frame &frame, 
 
 	switch (info.profile)
 	{
+	case Profile::H264_Base:
+	case Profile::H264_Main:
 	case Profile::H264_High:
 		h264.setup(caps, session_params, rate, video_coding_info, encode_info);
 		break;
@@ -1985,16 +1987,25 @@ VideoProfile::Format VideoProfile::get_format_info(Encoder::Impl &impl, VkImageU
 
 bool VideoProfile::setup(Encoder::Impl &impl, Profile profile)
 {
+	h264.profile = { VK_STRUCTURE_TYPE_VIDEO_ENCODE_H264_PROFILE_INFO_KHR };
+	profile_info.chromaSubsampling = VK_VIDEO_CHROMA_SUBSAMPLING_420_BIT_KHR;
+	profile_info.chromaBitDepth = VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR;
+	profile_info.lumaBitDepth = VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR;
+	profile_info.videoCodecOperation = VK_VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR;
+	profile_info.pNext = &h264.profile;
+
 	switch (profile)
 	{
+	case Profile::H264_Base:
+		h264.profile.stdProfileIdc = STD_VIDEO_H264_PROFILE_IDC_BASELINE;
+		break;
+
+	case Profile::H264_Main:
+		h264.profile.stdProfileIdc = STD_VIDEO_H264_PROFILE_IDC_MAIN;
+		break;
+
 	case Profile::H264_High:
-		h264.profile = { VK_STRUCTURE_TYPE_VIDEO_ENCODE_H264_PROFILE_INFO_KHR };
-		profile_info.chromaSubsampling = VK_VIDEO_CHROMA_SUBSAMPLING_420_BIT_KHR;
-		profile_info.chromaBitDepth = VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR;
-		profile_info.lumaBitDepth = VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR;
-		profile_info.videoCodecOperation = VK_VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR;
 		h264.profile.stdProfileIdc = STD_VIDEO_H264_PROFILE_IDC_HIGH;
-		profile_info.pNext = &h264.profile;
 		break;
 
 	case Profile::H265_Main:
@@ -2042,6 +2053,8 @@ bool VideoEncoderCaps::setup(Encoder::Impl &impl)
 
 	switch (impl.info.profile)
 	{
+	case Profile::H264_Base:
+	case Profile::H264_Main:
 	case Profile::H264_High:
 		h264.caps = { VK_STRUCTURE_TYPE_VIDEO_ENCODE_H264_CAPABILITIES_KHR };
 		encode_caps.pNext = &h264.caps;
@@ -2153,6 +2166,8 @@ bool VideoSessionParameters::init(Encoder::Impl &impl)
 {
 	switch (impl.info.profile)
 	{
+	case Profile::H264_Base:
+	case Profile::H264_Main:
 	case Profile::H264_High:
 		return init_h264(impl);
 
@@ -2513,6 +2528,23 @@ bool VideoSessionParameters::init_h264(Encoder::Impl &impl)
 	if (impl.caps.h264.caps.stdSyntaxFlags & VK_VIDEO_ENCODE_H264_STD_ENTROPY_CODING_MODE_FLAG_SET_BIT_KHR)
 		pps.flags.entropy_coding_mode_flag = 1;
 
+	if (impl.info.profile == Profile::H264_Base)
+	{
+		// Level should be 3.0 or lower for baseline (to be confirmed by actual source other than ChatGPT).
+		if (sps.level_idc > STD_VIDEO_H264_LEVEL_IDC_3_0)
+			sps.level_idc = STD_VIDEO_H264_LEVEL_IDC_3_0;
+		// Baseline does not support CABAC encoding (only CAVLC) but caps can still set the 
+		// VK_VIDEO_ENCODE_H264_STD_ENTROPY_CODING_MODE_FLAG_SET_BIT_KHR flag !!! (angry face)
+		pps.flags.entropy_coding_mode_flag = 0;
+		// Weight prediction not supported in Baseline.
+		pps.flags.weighted_pred_flag = 0;
+		pps.weighted_bipred_idc = STD_VIDEO_H264_WEIGHTED_BIPRED_IDC_DEFAULT;
+		// Custom scaling matrices not supported in Baseline.
+		pps.flags.pic_scaling_matrix_present_flag = 0;
+		// 8x8 Transform mode not supported in Baseline.
+		pps.flags.transform_8x8_mode_flag = 0;
+	}
+
 	add_info.pStdPPSs = &pps;
 	add_info.pStdSPSs = &sps;
 	add_info.stdPPSCount = 1;
@@ -2655,7 +2687,7 @@ bool RateControl::init(Encoder::Impl &impl)
 		if (rate_info.rateControlMode == VK_VIDEO_ENCODE_RATE_CONTROL_MODE_CBR_BIT_KHR)
 			layer.maxBitrate = layer.averageBitrate;
 
-		if (impl.info.profile == Profile::H264_High)
+		if (impl.info.profile == Profile::H264_Base || impl.info.profile == Profile::H264_Main || impl.info.profile == Profile::H264_High)
 		{
 			rate_info.pNext = &h264.rate_control;
 			layer.pNext = &h264.layer;
