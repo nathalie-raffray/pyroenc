@@ -205,7 +205,7 @@ struct RateControl
 	bool init(Encoder::Impl &impl);
 
 	uint64_t frame_index = 0;
-	uint64_t gop_frame_index = 0;
+	uint32_t gop_frame_index = 0;
 	uint32_t idr_pic_id = 0;
 	bool needs_reset = true;
 
@@ -1219,6 +1219,7 @@ void H265EncodeInfo::setup(
 
 	pic.flags.IrapPicFlag = is_idr ? 1 : 0;
 	pic.flags.is_reference = 1;
+	pic.flags.pic_output_flag = 1;
 	pic.pRefLists = &ref_lists;
 
 	short_term_ref_pic_set.num_negative_pics = 1;
@@ -1267,6 +1268,7 @@ void H265EncodeInfo::setup(
 	h265_reconstructed_dpb_slot.pStdReferenceInfo = &h265_reconstructed_ref;
 	h265_reconstructed_ref.PicOrderCntVal = int(rate.gop_frame_index & PicOrderCntMask);
 	const_cast<VkVideoReferenceSlotInfoKHR *>(info.pSetupReferenceSlot)->pNext = &h265_reconstructed_dpb_slot;
+	const_cast<VkVideoReferenceSlotInfoKHR *>(begin_info.pReferenceSlots)[0].pNext = &h265_reconstructed_dpb_slot;
 
 	pic.PicOrderCntVal = h265_reconstructed_ref.PicOrderCntVal;
 
@@ -1278,6 +1280,8 @@ void H265EncodeInfo::setup(
 	{
 		assert(info.referenceSlotCount == 1);
 		const_cast<VkVideoReferenceSlotInfoKHR &>(info.pReferenceSlots[0]).pNext = &h265_prev_ref_slot;
+		const_cast<VkVideoReferenceSlotInfoKHR *>(begin_info.pReferenceSlots)[1].pNext = &h265_prev_ref_slot;
+
 		h265_prev_ref_slot.pStdReferenceInfo = &h265_prev_ref;
 
 		h265_prev_ref.PicOrderCntVal = int((rate.gop_frame_index - 1) & PicOrderCntMask);
@@ -2332,6 +2336,7 @@ bool VideoSessionParameters::init_h265(Encoder::Impl &impl)
 	sps.max_transform_hierarchy_depth_intra = max_transform_hierarchy;
 
 	StdVideoH265DecPicBufMgr dec_pic_buf_mgr = {};
+	dec_pic_buf_mgr.max_dec_pic_buffering_minus1[0] = DPBSize - 1;
 
 	// Should probably provide pShortTermRefPicSet here I think,
 	// but GPU hangs randomly on RADV when using that.
@@ -2748,6 +2753,7 @@ bool RateControl::init(Encoder::Impl &impl)
 			if (info.gop_frames == 0)
 				info.gop_frames = 1;
 
+			h265.rate_control.subLayerCount = 1;
 			h265.rate_control.consecutiveBFrameCount = 0;
 			h265.rate_control.idrPeriod = info.gop_frames;
 			h265.rate_control.gopFrameCount = info.gop_frames;
