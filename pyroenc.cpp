@@ -2528,8 +2528,12 @@ bool VideoSessionParameters::init_h264(Encoder::Impl &impl)
 	// This is arbitrary.
 	sps.log2_max_pic_order_cnt_lsb_minus4 = 4;
 
-	if (impl.caps.h264.caps.stdSyntaxFlags & VK_VIDEO_ENCODE_H264_STD_TRANSFORM_8X8_MODE_FLAG_SET_BIT_KHR)
-		pps.flags.transform_8x8_mode_flag = 1;
+	// Transform 8x8 mode is supported for main and high profiles but it leads to an error in encoding the
+	// pps on nvidia only for main profile. There may be more settings to set for main to support 8x8, or
+	// its a driver error
+	if (impl.caps.h264.caps.stdSyntaxFlags & VK_VIDEO_ENCODE_H264_STD_TRANSFORM_8X8_MODE_FLAG_SET_BIT_KHR
+		&& impl.info.profile != Profile::H264_Main)
+			pps.flags.transform_8x8_mode_flag = 1;
 	if (impl.caps.h264.caps.stdSyntaxFlags & VK_VIDEO_ENCODE_H264_STD_ENTROPY_CODING_MODE_FLAG_SET_BIT_KHR)
 		pps.flags.entropy_coding_mode_flag = 1;
 
@@ -2615,6 +2619,7 @@ bool VideoSessionParameters::init_h264(Encoder::Impl &impl)
 	{
 		VK_CALL(vkDestroyVideoSessionParametersKHR(impl.info.device, params, nullptr));
 		params = VK_NULL_HANDLE;
+		return false;
 	}
 
 	encoded_parameters.resize(params_size);
